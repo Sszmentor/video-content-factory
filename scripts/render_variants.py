@@ -685,6 +685,10 @@ def generate_v8b(words, overlays, output_path, max_words=3):
     subs.info["PlayResY"] = "1920"
     subs.info["ScaledBorderAndShadow"] = "yes"
 
+    # Hold last subtitle of each layer until video end
+    # (ffmpeg clips to actual video duration, so overshoot is safe)
+    VIDEO_HOLD_END_MS = int(words[-1].end * 1000) + 10000
+
     # TOP: Small transcription — WHITE text on BLACK opaque background
     # Like viral shorts: always readable regardless of video content behind
     style_trans = pysubs2.SSAStyle()
@@ -697,10 +701,10 @@ def generate_v8b(words, overlays, output_path, max_words=3):
     style_trans.backcolor = _ass_color(0, 0, 0, 0)               # FULLY OPAQUE black box
     style_trans.outline = 8                                        # padding around text
     style_trans.shadow = 0
-    style_trans.alignment = 8                                      # top-center
-    style_trans.marginv = 100
-    style_trans.marginl = 40
-    style_trans.marginr = 40
+    style_trans.alignment = 7                                      # top-LEFT (typewriter: text grows right)
+    style_trans.marginv = 230
+    style_trans.marginl = 150
+    style_trans.marginr = 150
     style_trans.borderstyle = 3                                    # opaque background box
     subs.styles["SmallTrans"] = style_trans
 
@@ -756,48 +760,177 @@ def generate_v8b(words, overlays, output_path, max_words=3):
     subs.styles["CTA"] = style_cta
 
     # --- Layer 1 (TOP): Small running transcription ---
-    # Accumulating text: words add step-by-step until ~2 lines filled,
-    # then reset. Each step REPLACES the previous (non-overlapping timing).
-    WORDS_PER_BLOCK = 14  # ~2 lines at 32px on 1080px width
-    STEP_SIZE = 3          # add 3 words per step
-    block_start_idx = 0
-    while block_start_idx < len(words):
-        block_end_idx = min(block_start_idx + WORDS_PER_BLOCK, len(words))
-        block_words = words[block_start_idx:block_end_idx]
+    # Typewriter effect: words appear one-by-one, never jump between lines.
+    # Uses explicit \N line breaks so ASS soft-wrap never shifts words.
+    CHARS_PER_LINE = 34     # chars per line (~780px at 32px Arial)
+    CHARS_HARD_MAX = 42     # absolute max before forced break (allows number+unit overflow)
+    MAX_LINES = 2           # max 2 lines, then reset block
+    STEP_SIZE = 1           # word-by-word typewriter (attracts eye)
+    AVG_CHAR_PX = 18        # estimated pixel width per char at 32px Arial regular
 
-        # Build list of steps: [(visible_words_count, start_ms, end_ms)]
+    def _is_sentence_end(word_text):
+        """Check if word ends a sentence."""
+        stripped = word_text.rstrip()
+        return stripped.endswith(('.', '!', '?', '…'))
+
+    def _is_number_group(word):
+        """Check if word is a number, unit, preposition before number, or % sign.
+        These should stick together on one line."""
+        w = word.rstrip('.,!?;:')
+        if re.match(r'^\d+[\-.,]?\d*%?$', w):          # 29, 6%, 522, 10
+            return True
+        if re.match(r'^\d+[\-]?[А-Яа-яA-Za-z]+', w):   # 522-ФЗ
+            return True
+        if w.lower() in ('на', 'до', 'от', 'за', 'по', 'в', 'с', 'к', 'не', 'менее', 'более', 'меньше', 'больше'):
+            return True  # short prepositions that should stick to next word
+        if w in ('млрд', 'млн', 'тыс', 'руб', 'рублей', 'миллиардов', 'миллионов', 'процентов', 'дней', 'лет', 'месяцев'):
+            return True  # units after numbers
+        return False
+
+    def _layout_lines(display_words, chars_per_line, chars_hard_max):
+        """Arrange words into lines with explicit breaks.
+        Keeps number+unit groups together even if slightly over chars_per_line.
+        Only breaks at chars_hard_max."""
+        lines = []
+        current_line_words = []
+        current_len = 0
+        for i, w in enumerate(display_words):
+            space = 1 if current_line_words else 0
+            new_len = current_len + space + len(w)
+            if current_line_words and new_len > chars_per_line:
+                # Over soft limit — but keep number groups together
+                is_group = _is_number_group(w)
+                prev_is_group = current_line_words and _is_number_group(current_line_words[-1])
+                if (is_group or prev_is_group) and new_len <= chars_hard_max:
+                    # Allow overflow to keep group on same line
+                    current_line_words.append(w)
+                    current_len = new_len
+                else:
+                    # Break to new line
+                    lines.append(" ".join(current_line_words))
+                    current_line_words = [w]
+                    current_len = len(w)
+            else:
+                current_line_words.append(w)
+                current_len = new_len
+        if current_line_words:
+            lines.append(" ".join(current_line_words))
+        return lines
+
+    # Step 1: Split words into sentences
+    sentences = []
+    current_sentence = []
+    for w in words:
+        current_sentence.append(w)
+        if _is_sentence_end(w.text):
+            sentences.append(current_sentence)
+            current_sentence = []
+    if current_sentence:
+        sentences.append(current_sentence)
+
+    # Step 2: Group sentences into blocks (max 2 lines, no mid-sentence splits)
+    max_block_chars = CHARS_PER_LINE * MAX_LINES
+    blocks = []
+    current_block_words = []
+    current_chars = 0
+    for sent in sentences:
+        sent_chars = sum(len(w.text) + 1 for w in sent)
+        if current_block_words and current_chars + sent_chars >= max_block_chars:
+            blocks.append(current_block_words)
+            current_block_words = []
+            current_chars = 0
+        if sent_chars > max_block_chars and not current_block_words:
+            chunk = []
+            chunk_chars = 0
+            for w in sent:
+                w_chars = len(w.text) + 1
+                if chunk and chunk_chars + w_chars > max_block_chars:
+                    blocks.append(chunk)
+                    chunk = []
+                    chunk_chars = 0
+                chunk.append(w)
+                chunk_chars += w_chars
+            if chunk:
+                current_block_words = chunk
+                current_chars = chunk_chars
+        else:
+            current_block_words.extend(sent)
+            current_chars += sent_chars
+    if current_block_words:
+        blocks.append(current_block_words)
+
+    # Step 3: Generate typewriter subtitle events per block
+    for bi, block_words in enumerate(blocks):
+        is_final_block = (block_words[-1] is words[-1])
+        if bi + 1 < len(blocks):
+            block_max_end = int(blocks[bi + 1][0].start * 1000)
+        else:
+            block_max_end = VIDEO_HOLD_END_MS  # last block holds until video end
+
+        # Pre-calculate block position: center the FINAL (max-width) text
+        final_raw = " ".join(w.text for w in block_words)
+        final_processed = postprocess_subtitle_text(final_raw, is_last_phrase=is_final_block)
+        final_display = final_processed.split()
+        final_lines = _layout_lines(final_display, CHARS_PER_LINE, CHARS_HARD_MAX)
+        max_line_chars = max(len(line) for line in final_lines)
+        max_line_px = max_line_chars * AVG_CHAR_PX
+        x_pos = max(30, int((1080 - max_line_px) / 2))
+        y_pos = style_trans.marginv  # use configured marginv
+
+        # Build steps: word-by-word, but group short prepositions/numbers with next word
+        def _is_glue_word(w_text):
+            """Words that should NOT appear alone — they stick to the NEXT word."""
+            t = w_text.rstrip('.,!?;:').lower()
+            # Short prepositions and particles
+            if t in ('в', 'на', 'с', 'к', 'у', 'о', 'за', 'до', 'от', 'по', 'из', 'не', 'ни', 'же'):
+                return True
+            # Bare numbers (should appear with their unit: "29 миллиардов", "10 дней")
+            if re.match(r'^\d+$', t):
+                return True
+            return False
+
         steps = []
-        for step_end in range(STEP_SIZE, len(block_words) + STEP_SIZE, STEP_SIZE):
+        wi = 0
+        while wi < len(block_words):
+            # Peek ahead: if current word is a glue word, skip to next
+            step_end = wi + 1
+            while step_end < len(block_words) and _is_glue_word(block_words[step_end - 1].text):
+                step_end += 1
             step_end = min(step_end, len(block_words))
-            # Start: when the newest batch of words begins
-            new_start = max(0, step_end - STEP_SIZE)
-            start_ms = int(block_words[new_start].start * 1000)
+            start_ms = int(block_words[wi].start * 1000)
             steps.append((step_end, start_ms))
+            wi = step_end
 
-        # Set end times: each step ends when the next one starts
         for i in range(len(steps)):
             word_count, start_ms = steps[i]
             if i + 1 < len(steps):
-                end_ms = steps[i + 1][1]  # next step's start
+                end_ms = steps[i + 1][1]
             else:
-                end_ms = int(block_words[-1].end * 1000) + 400  # hold last step
+                end_ms = block_max_end  # holds until next block or video end
 
+            # Build display text with postprocessing
             visible = block_words[:word_count]
             raw_text = " ".join(w.text for w in visible)
-            text = postprocess_subtitle_text(raw_text, is_last_phrase=(block_end_idx >= len(words)))
+            processed = postprocess_subtitle_text(raw_text, is_last_phrase=is_final_block)
+
+            # Layout into lines with explicit \N breaks (words never jump)
+            display_words = processed.split()
+            lines = _layout_lines(display_words, CHARS_PER_LINE, CHARS_HARD_MAX)
+            text_body = "\\N".join(lines)
+            # Position block so its center = frame center (540px)
+            text = f"{{\\pos({x_pos},{y_pos})}}" + text_body
 
             subs.events.append(pysubs2.SSAEvent(
                 start=start_ms, end=end_ms, style="SmallTrans", text=text
             ))
-
-        block_start_idx = block_end_idx
 
     # --- Layer 2 (BOTTOM): Big static subtitles ---
     phrases = group_words_into_phrases(words, max_words=max_words, min_words=1)
     for pi, phrase in enumerate(phrases):
         is_last = (pi == len(phrases) - 1)
         line_start_ms = int(phrase[0].start * 1000)
-        line_end_ms = int(phrase[-1].end * 1000) + 150
+        # Last phrase holds until video end (viewer remembers final message)
+        line_end_ms = VIDEO_HOLD_END_MS if is_last else int(phrase[-1].end * 1000) + 150
         if pi > 0:
             prev_end = int(phrases[pi - 1][-1].end * 1000) + 150
             if line_start_ms < prev_end + INTER_GAP_MS:
@@ -815,9 +948,10 @@ def generate_v8b(words, overlays, output_path, max_words=3):
         is_last = (oi == len(overlays) - 1)
         is_cta = is_last and any(kw in ov["text"].upper() for kw in ["ПОДПИШИСЬ", "SUBSCRIBE"])
         if is_cta:
+            # CTA holds until video end — viewer must remember call to action
             text = f"{{\\fad(300,0)}}↓↓↓ {ov['text']} ↓↓↓"
             subs.events.append(pysubs2.SSAEvent(
-                start=int(ov["start"]*1000), end=int(ov["end"]*1000), style="CTA", text=text
+                start=int(ov["start"]*1000), end=VIDEO_HOLD_END_MS, style="CTA", text=text
             ))
         else:
             highlighted = _v8_highlight_text(ov["text"])
@@ -873,6 +1007,11 @@ def main():
         "v7": generate_v7,
         "v8a": generate_v8a,
         "v8b": generate_v8b,
+        "v8c": generate_v8b,  # V8C = V8B with sentence-aware SmallTrans
+        "v8d": generate_v8b,  # V8D = narrower SmallTrans (150+150, marginv 170)
+        "v8e": generate_v8b,  # V8E = medium SmallTrans (120+120, marginv 150)
+        "v8f": generate_v8b,  # V8F = V8D + left-align typewriter (alignment=7)
+        "v8g": generate_v8b,  # V8G = V8F + hold last subs/CTA until video end
     }
     if args.variant:
         selected = {args.variant: all_variants[args.variant]}
