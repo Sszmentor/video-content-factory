@@ -52,12 +52,14 @@ class SyncResult:
     """Result of lip-sync detection and optional correction."""
     offset_ms: float            # positive = lips lead audio (need to delay audio)
     confidence: float           # 0-1, peak-to-mean ratio of cross-correlation
+    discriminability: float     # 0-1, (peak - 2nd_peak) / peak — higher = more certain
     direction: str              # "lips_lead" | "lips_lag" | "in_sync" | "unknown"
     correction_applied: bool
     corrected_file: Optional[str]
     reason: str                 # human-readable explanation
     face_detection_rate: float  # fraction of frames with detected face (0-1)
     mar_signal_length: int      # number of frames analyzed
+    verified_residual_ms: Optional[float] = None  # residual after self-verification
 
 
 @dataclass
@@ -247,14 +249,15 @@ class SyncDetector:
         return energy
 
     def cross_correlate(self, visual_signal: np.ndarray,
-                        audio_signal: np.ndarray) -> tuple[float, float]:
+                        audio_signal: np.ndarray) -> tuple[float, float, float]:
         """
         FFT-based cross-correlation of visual MAR with audio energy.
 
-        Returns (offset_ms, confidence).
+        Returns (offset_ms, confidence, discriminability).
             offset_ms > 0: visual leads audio (lips move before sound)
             offset_ms < 0: visual lags audio (lips move after sound)
             confidence: 0-1 (peak-to-mean ratio, normalized)
+            discriminability: 0-1 ((peak - 2nd_peak) / peak) — higher = more certain
         """
         # Trim to same length
         min_len = min(len(visual_signal), len(audio_signal))
@@ -285,8 +288,9 @@ class SyncDetector:
         valid_neg = correlation[-max_offset_frames:]
 
         combined = np.concatenate([valid_pos, valid_neg])
+        abs_combined = np.abs(combined)
 
-        peak_idx = np.argmax(np.abs(combined))
+        peak_idx = int(np.argmax(abs_combined))
         if peak_idx <= max_offset_frames:
             offset_frames = peak_idx
         else:
@@ -295,15 +299,72 @@ class SyncDetector:
         offset_ms = offset_frames * ms_per_frame
 
         # Confidence: peak-to-mean ratio, normalized to 0-1
-        # Note: visual-audio correlation is weaker than audio-audio,
-        # so we use normalization factor 5 (not 20 as in measure_sync.py)
-        peak_val = np.abs(combined[peak_idx])
-        mean_val = np.mean(np.abs(combined))
+        peak_val = float(abs_combined[peak_idx])
+        mean_val = float(np.mean(abs_combined))
         confidence = float(peak_val / (mean_val + 1e-8))
         confidence = min(confidence / 5.0, 1.0)
 
-        log.info(f"Cross-correlation: offset={offset_ms:.1f}ms, confidence={confidence:.3f}")
-        return offset_ms, confidence
+        # Discriminability: (peak - 2nd_peak) / peak
+        # Find 2nd highest peak NOT adjacent to the main peak (±2 frames away)
+        sorted_indices = np.argsort(-abs_combined)
+        second_peak_val = 0.0
+        second_peak_lag = 0
+        for idx in sorted_indices:
+            if idx <= max_offset_frames:
+                lag = idx
+            else:
+                lag = -(len(combined) - idx)
+            if abs(lag - offset_frames) > 2:
+                second_peak_val = float(abs_combined[idx])
+                second_peak_lag = lag
+                break
+        discriminability = (peak_val - second_peak_val) / (peak_val + 1e-8)
+
+        log.info(f"Cross-correlation: offset={offset_ms:.1f}ms, confidence={confidence:.3f}, "
+                 f"discriminability={discriminability:.3f}")
+
+        # Log diagnostic info when discriminability is low
+        if discriminability < 0.15:
+            log.warning(f"  Low discriminability: peak at {offset_ms:+.0f}ms barely above "
+                        f"2nd peak at {second_peak_lag * ms_per_frame:+.0f}ms "
+                        f"(diff={discriminability:.1%})")
+            # Show top-5 peaks for diagnostic
+            top5 = []
+            for idx in sorted_indices[:5]:
+                if idx <= max_offset_frames:
+                    lag = idx
+                else:
+                    lag = -(len(combined) - idx)
+                top5.append(f"{lag * ms_per_frame:+.0f}ms({abs_combined[idx]:.4f})")
+            log.warning(f"  Top-5 peaks: {' '.join(top5)}")
+
+        return offset_ms, confidence, discriminability
+
+    def self_verify(self, mar_signal: np.ndarray, audio_energy: np.ndarray,
+                    detected_offset_ms: float) -> float:
+        """Verify detection by shifting audio and re-detecting.
+
+        Shifts audio by detected offset, then re-runs cross-correlation.
+        Expects residual ~0ms if the detection is correct.
+
+        Returns residual_ms (ideally close to 0).
+        At 25fps, residuals < 40ms are expected due to frame quantization.
+        """
+        ms_per_frame = 1000.0 / self.analysis_fps
+        shift_frames = int(round(detected_offset_ms / ms_per_frame))
+        min_len = min(len(mar_signal), len(audio_energy))
+        mar = mar_signal[:min_len]
+        aud = audio_energy[:min_len]
+
+        if shift_frames >= 0:
+            shifted = np.concatenate([aud[shift_frames:], np.zeros(shift_frames)])
+        else:
+            shifted = np.concatenate([np.zeros(-shift_frames), aud[:min_len + shift_frames]])
+
+        residual_ms, _, _ = self.cross_correlate(mar, shifted[:min_len])
+        log.info(f"Self-verification: shift={detected_offset_ms:+.1f}ms → residual={residual_ms:+.1f}ms "
+                 f"({'OK' if abs(residual_ms) <= ms_per_frame else 'CHECK'})")
+        return residual_ms
 
     # ------------------------------------------------------------------
     # Adaptive sync methods (sub-frame precision, per-chunk analysis)
@@ -333,11 +394,11 @@ class SyncDetector:
         return peak_idx + delta
 
     def cross_correlate_subframe(self, visual_signal: np.ndarray,
-                                 audio_signal: np.ndarray) -> tuple[float, float]:
+                                 audio_signal: np.ndarray) -> tuple[float, float, float]:
         """Cross-correlation with sub-frame precision via parabolic interpolation.
 
         Same as cross_correlate() but adds parabolic peak refinement.
-        Returns (offset_ms, confidence) with ~20ms precision at 25fps.
+        Returns (offset_ms, confidence, discriminability) with ~20ms precision at 25fps.
         """
         min_len = min(len(visual_signal), len(audio_signal))
         vis = visual_signal[:min_len]
@@ -361,14 +422,13 @@ class SyncDetector:
 
         peak_idx = int(np.argmax(np.abs(combined)))
 
-        # Integer offset (as before)
+        # Integer offset
         if peak_idx <= max_offset_frames:
             offset_frames_int = peak_idx
         else:
             offset_frames_int = -(len(combined) - peak_idx)
 
         # Sub-frame refinement via parabolic interpolation
-        # Work with absolute correlation for interpolation
         abs_combined = np.abs(combined)
         refined_idx = self._parabolic_interpolation(abs_combined, peak_idx)
 
@@ -380,12 +440,25 @@ class SyncDetector:
         offset_ms = offset_frames * ms_per_frame
 
         # Confidence
-        peak_val = abs_combined[peak_idx]
-        mean_val = np.mean(abs_combined)
+        peak_val = float(abs_combined[peak_idx])
+        mean_val = float(np.mean(abs_combined))
         confidence = float(peak_val / (mean_val + 1e-8))
         confidence = min(confidence / 5.0, 1.0)
 
-        return offset_ms, confidence
+        # Discriminability
+        sorted_indices = np.argsort(-abs_combined)
+        second_peak_val = 0.0
+        for idx in sorted_indices:
+            if idx <= max_offset_frames:
+                lag = idx
+            else:
+                lag = -(len(combined) - idx)
+            if abs(lag - offset_frames_int) > 2:
+                second_peak_val = float(abs_combined[idx])
+                break
+        discriminability = (peak_val - second_peak_val) / (peak_val + 1e-8)
+
+        return offset_ms, confidence, discriminability
 
     def _cross_correlate_constrained(self, visual_signal: np.ndarray,
                                      audio_signal: np.ndarray,
@@ -516,10 +589,11 @@ class SyncDetector:
         audio_energy = self.extract_audio_energy(video_path)
 
         # Phase 1: Global offset (reliable baseline)
-        global_offset_ms, global_confidence = self.cross_correlate_subframe(
+        global_offset_ms, global_confidence, global_disc = self.cross_correlate_subframe(
             mar_signal, audio_energy
         )
-        log.info(f"Phase 1 — Global: {global_offset_ms:+.1f}ms (confidence={global_confidence:.3f})")
+        log.info(f"Phase 1 — Global: {global_offset_ms:+.1f}ms "
+                 f"(confidence={global_confidence:.3f}, discriminability={global_disc:.3f})")
 
         # Phase 2: Per-chunk constrained refinement
         chunk_frames = int(chunk_sec * self.analysis_fps)
@@ -615,9 +689,10 @@ class SyncDetector:
 
     def detect(self, video_path: str) -> SyncResult:
         """
-        Full detection pipeline: extract frames → MAR → audio energy → correlate.
+        Full detection pipeline: extract frames → MAR → audio energy → correlate → verify.
 
-        Returns SyncResult with measured offset and confidence.
+        Returns SyncResult with measured offset, confidence, discriminability,
+        and self-verification residual.
         Does NOT apply any correction (use SyncFixer for that).
         """
         log.info(f"Analyzing: {video_path}")
@@ -626,7 +701,7 @@ class SyncDetector:
         frames = self.extract_frames(video_path)
         if len(frames) < int(2 * self.analysis_fps):  # < 2 seconds
             return SyncResult(
-                offset_ms=0, confidence=0, direction="unknown",
+                offset_ms=0, confidence=0, discriminability=0, direction="unknown",
                 correction_applied=False, corrected_file=None,
                 reason=f"Video too short ({len(frames)} frames, need ≥{2*self.analysis_fps})",
                 face_detection_rate=0, mar_signal_length=len(frames)
@@ -636,7 +711,7 @@ class SyncDetector:
         mar_signal, detection_rate = self.compute_mar_signal(frames)
         if detection_rate < 0.5:
             return SyncResult(
-                offset_ms=0, confidence=0, direction="unknown",
+                offset_ms=0, confidence=0, discriminability=0, direction="unknown",
                 correction_applied=False, corrected_file=None,
                 reason=f"Face detected in only {detection_rate:.0%} of frames (need ≥50%)",
                 face_detection_rate=detection_rate, mar_signal_length=len(frames)
@@ -646,7 +721,10 @@ class SyncDetector:
         audio_energy = self.extract_audio_energy(video_path)
 
         # Step 4: Cross-correlate
-        offset_ms, confidence = self.cross_correlate(mar_signal, audio_energy)
+        offset_ms, confidence, discriminability = self.cross_correlate(mar_signal, audio_energy)
+
+        # Step 5: Self-verification (shift audio and re-detect → expect ~0ms)
+        residual_ms = self.self_verify(mar_signal, audio_energy, offset_ms)
 
         # Determine direction
         if abs(offset_ms) <= 1.0:
@@ -656,15 +734,22 @@ class SyncDetector:
         else:
             direction = "lips_lag"
 
+        reason = (f"Detected: {offset_ms:.1f}ms ({direction}), "
+                  f"confidence={confidence:.3f}, discriminability={discriminability:.3f}")
+        if abs(residual_ms) > 1000.0 / self.analysis_fps:
+            reason += f", residual={residual_ms:+.1f}ms (check)"
+
         return SyncResult(
             offset_ms=round(offset_ms, 1),
             confidence=round(confidence, 3),
+            discriminability=round(discriminability, 3),
             direction=direction,
             correction_applied=False,
             corrected_file=None,
-            reason=f"Detected: {offset_ms:.1f}ms ({direction}), confidence={confidence:.3f}",
+            reason=reason,
             face_detection_rate=round(detection_rate, 3),
-            mar_signal_length=len(mar_signal)
+            mar_signal_length=len(mar_signal),
+            verified_residual_ms=round(residual_ms, 1)
         )
 
     @staticmethod
@@ -1184,7 +1269,7 @@ def batch_sync_fix(heygen_dir: str, enhanced_dir: str,
         except Exception as e:
             log.error(f"Error processing {video.name}: {e}")
             results[video.name] = SyncResult(
-                offset_ms=0, confidence=0, direction="error",
+                offset_ms=0, confidence=0, discriminability=0, direction="error",
                 correction_applied=False, corrected_file=None,
                 reason=f"Error: {str(e)}", face_detection_rate=0,
                 mar_signal_length=0
@@ -1275,12 +1360,18 @@ Examples:
         detector = SyncDetector(analysis_fps=args.fps)
         result = detector.detect(args.video)
         print(f"\n{'='*50}")
-        print(f"  Offset:     {result.offset_ms:+.1f} ms")
-        print(f"  Direction:  {result.direction}")
-        print(f"  Confidence: {result.confidence:.3f}")
-        print(f"  Face rate:  {result.face_detection_rate:.0%}")
-        print(f"  Frames:     {result.mar_signal_length}")
-        print(f"  Verdict:    {result.reason}")
+        print(f"  Offset:          {result.offset_ms:+.1f} ms")
+        print(f"  Direction:       {result.direction}")
+        print(f"  Confidence:      {result.confidence:.3f}")
+        print(f"  Discriminability:{result.discriminability:.3f}"
+              f"{'  ⚠ LOW' if result.discriminability < 0.1 else ''}")
+        print(f"  Face rate:       {result.face_detection_rate:.0%}")
+        print(f"  Frames:          {result.mar_signal_length}")
+        if result.verified_residual_ms is not None:
+            residual_ok = abs(result.verified_residual_ms) <= 40
+            print(f"  Verification:    {result.verified_residual_ms:+.1f}ms"
+                  f" {'✓' if residual_ok else '⚠ CHECK'}")
+        print(f"  Verdict:         {result.reason}")
         print(f"{'='*50}")
 
     elif args.command == 'fix':
@@ -1292,13 +1383,19 @@ Examples:
             analysis_fps=args.fps
         )
         print(f"\n{'='*50}")
-        print(f"  Offset:     {result.offset_ms:+.1f} ms")
-        print(f"  Direction:  {result.direction}")
-        print(f"  Confidence: {result.confidence:.3f}")
-        print(f"  Corrected:  {result.correction_applied}")
+        print(f"  Offset:          {result.offset_ms:+.1f} ms")
+        print(f"  Direction:       {result.direction}")
+        print(f"  Confidence:      {result.confidence:.3f}")
+        print(f"  Discriminability:{result.discriminability:.3f}"
+              f"{'  ⚠ LOW' if result.discriminability < 0.1 else ''}")
+        print(f"  Corrected:       {result.correction_applied}")
         if result.corrected_file:
-            print(f"  Output:     {result.corrected_file}")
-        print(f"  Verdict:    {result.reason}")
+            print(f"  Output:          {result.corrected_file}")
+        if result.verified_residual_ms is not None:
+            residual_ok = abs(result.verified_residual_ms) <= 40
+            print(f"  Verification:    {result.verified_residual_ms:+.1f}ms"
+                  f" {'✓' if residual_ok else '⚠ CHECK'}")
+        print(f"  Verdict:         {result.reason}")
         print(f"{'='*50}")
 
     elif args.command == 'adaptive':
