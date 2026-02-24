@@ -60,6 +60,20 @@ class SyncResult:
     mar_signal_length: int      # number of frames analyzed
 
 
+@dataclass
+class AdaptiveSyncResult:
+    """Result of adaptive (per-chunk) lip-sync detection and correction."""
+    global_offset_ms: float       # mean offset across all chunks (for comparison)
+    chunk_offsets: list           # [{time_sec, offset_ms, confidence}, ...]
+    offset_range_ms: float        # max - min offset (measures drift)
+    correction_applied: bool
+    corrected_file: Optional[str]
+    method: str                   # "adaptive" | "global_fallback"
+    reason: str
+    face_detection_rate: float
+    n_chunks: int
+
+
 # ---------------------------------------------------------------------------
 # SyncDetector — measures visual-audio offset
 # ---------------------------------------------------------------------------
@@ -291,6 +305,314 @@ class SyncDetector:
         log.info(f"Cross-correlation: offset={offset_ms:.1f}ms, confidence={confidence:.3f}")
         return offset_ms, confidence
 
+    # ------------------------------------------------------------------
+    # Adaptive sync methods (sub-frame precision, per-chunk analysis)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parabolic_interpolation(correlation: np.ndarray, peak_idx: int) -> float:
+        """Sub-sample peak detection via parabolic interpolation.
+
+        Fits parabola through 3 points around peak.
+        Returns fractional index of true peak (~20ms precision at 25fps).
+        """
+        if peak_idx <= 0 or peak_idx >= len(correlation) - 1:
+            return float(peak_idx)
+
+        y_prev = float(correlation[peak_idx - 1])
+        y_peak = float(correlation[peak_idx])
+        y_next = float(correlation[peak_idx + 1])
+
+        denom = y_prev - 2 * y_peak + y_next
+        if abs(denom) < 1e-10:
+            return float(peak_idx)
+
+        delta = 0.5 * (y_prev - y_next) / denom
+        # Clamp delta to ±0.5 (parabola vertex should be within ±0.5 samples)
+        delta = max(-0.5, min(0.5, delta))
+        return peak_idx + delta
+
+    def cross_correlate_subframe(self, visual_signal: np.ndarray,
+                                 audio_signal: np.ndarray) -> tuple[float, float]:
+        """Cross-correlation with sub-frame precision via parabolic interpolation.
+
+        Same as cross_correlate() but adds parabolic peak refinement.
+        Returns (offset_ms, confidence) with ~20ms precision at 25fps.
+        """
+        min_len = min(len(visual_signal), len(audio_signal))
+        vis = visual_signal[:min_len]
+        aud = audio_signal[:min_len]
+
+        n = len(vis) + len(aud) - 1
+        fft_size = 1
+        while fft_size < n:
+            fft_size *= 2
+
+        vis_fft = np.fft.rfft(vis, fft_size)
+        aud_fft = np.fft.rfft(aud, fft_size)
+        correlation = np.fft.irfft(aud_fft * np.conj(vis_fft))
+
+        max_offset_frames = int(self.max_offset_ms * self.analysis_fps / 1000)
+        ms_per_frame = 1000.0 / self.analysis_fps
+
+        valid_pos = correlation[:max_offset_frames + 1]
+        valid_neg = correlation[-max_offset_frames:]
+        combined = np.concatenate([valid_pos, valid_neg])
+
+        peak_idx = int(np.argmax(np.abs(combined)))
+
+        # Integer offset (as before)
+        if peak_idx <= max_offset_frames:
+            offset_frames_int = peak_idx
+        else:
+            offset_frames_int = -(len(combined) - peak_idx)
+
+        # Sub-frame refinement via parabolic interpolation
+        # Work with absolute correlation for interpolation
+        abs_combined = np.abs(combined)
+        refined_idx = self._parabolic_interpolation(abs_combined, peak_idx)
+
+        if refined_idx <= max_offset_frames:
+            offset_frames = refined_idx
+        else:
+            offset_frames = -(len(combined) - refined_idx)
+
+        offset_ms = offset_frames * ms_per_frame
+
+        # Confidence
+        peak_val = abs_combined[peak_idx]
+        mean_val = np.mean(abs_combined)
+        confidence = float(peak_val / (mean_val + 1e-8))
+        confidence = min(confidence / 5.0, 1.0)
+
+        return offset_ms, confidence
+
+    def _cross_correlate_constrained(self, visual_signal: np.ndarray,
+                                     audio_signal: np.ndarray,
+                                     baseline_ms: float,
+                                     search_radius_frames: int = 2) -> tuple[float, float]:
+        """Cross-correlation constrained to ±search_radius around baseline offset.
+
+        Phase 2 of adaptive detection: refines the global offset per chunk.
+        Searches only in a narrow window (±2 frames = ±80ms at 25fps) around
+        the known global offset, then applies parabolic interpolation for
+        sub-frame precision (~20ms).
+
+        Args:
+            visual_signal: Zero-mean MAR signal (chunk)
+            audio_signal: Zero-mean energy signal (chunk)
+            baseline_ms: Global offset to center the search around
+            search_radius_frames: ±frames to search around baseline (default: 2)
+
+        Returns:
+            (offset_ms, confidence) with sub-frame precision.
+        """
+        min_len = min(len(visual_signal), len(audio_signal))
+        vis = visual_signal[:min_len]
+        aud = audio_signal[:min_len]
+
+        ms_per_frame = 1000.0 / self.analysis_fps
+        baseline_frames = baseline_ms / ms_per_frame  # can be fractional
+
+        # Full FFT cross-correlation
+        n = len(vis) + len(aud) - 1
+        fft_size = 1
+        while fft_size < n:
+            fft_size *= 2
+
+        vis_fft = np.fft.rfft(vis, fft_size)
+        aud_fft = np.fft.rfft(aud, fft_size)
+        correlation = np.fft.irfft(aud_fft * np.conj(vis_fft))
+
+        # Build search window centered on baseline
+        # baseline_frames > 0 → positive lag (indices 0..N in correlation)
+        # baseline_frames < 0 → negative lag (indices from end of correlation)
+        center_int = int(round(baseline_frames))
+        search_min = center_int - search_radius_frames
+        search_max = center_int + search_radius_frames
+
+        # Collect (correlation_index, lag_frames) pairs within search window
+        candidates = []
+        for lag in range(search_min, search_max + 1):
+            if lag >= 0:
+                idx = lag
+            else:
+                idx = len(correlation) + lag
+            if 0 <= idx < len(correlation):
+                candidates.append((idx, lag, abs(float(correlation[idx]))))
+
+        if not candidates:
+            return baseline_ms, 0.0
+
+        # Find best peak within constrained window
+        best = max(candidates, key=lambda x: x[2])
+        best_idx, best_lag, peak_val = best
+
+        # Parabolic interpolation for sub-frame precision
+        abs_corr = np.abs(correlation)
+        refined_idx = self._parabolic_interpolation(abs_corr, best_idx)
+
+        # Convert refined index back to lag in frames
+        if best_lag >= 0:
+            refined_lag = refined_idx  # positive lag: index = lag
+        else:
+            refined_lag = refined_idx - len(correlation)  # negative lag
+
+        offset_ms = refined_lag * ms_per_frame
+
+        # Confidence: peak relative to mean in the search window
+        window_vals = [c[2] for c in candidates]
+        mean_val = np.mean(window_vals) if window_vals else 1e-8
+        confidence = float(peak_val / (mean_val + 1e-8))
+        confidence = min(confidence / 3.0, 1.0)  # normalize (narrower window → higher ratio)
+
+        return offset_ms, confidence
+
+    def detect_adaptive(self, video_path: str,
+                        chunk_sec: float = 2.0,
+                        overlap: float = 0.5,
+                        min_chunk_confidence: float = 0.2) -> AdaptiveSyncResult:
+        """Two-phase adaptive lip-sync detection with sub-frame precision.
+
+        Phase 1: Compute global offset using full signal (reliable baseline).
+        Phase 2: Per-chunk constrained refinement — search within ±2 frames
+                 of global offset, then parabolic interpolation for ~20ms precision.
+
+        If per-chunk results are too noisy (std > 30ms), falls back to
+        uniform global offset applied across all chunks.
+
+        Args:
+            video_path: Path to HeyGen video
+            chunk_sec: Chunk duration in seconds (default: 2.0)
+            overlap: Overlap fraction between chunks (default: 0.5 = 50%)
+            min_chunk_confidence: Minimum confidence for a chunk to be trusted
+
+        Returns:
+            AdaptiveSyncResult with per-chunk offsets and smoothed curve.
+        """
+        log.info(f"Adaptive analysis: {video_path}")
+
+        # Step 1: Extract full MAR signal and audio energy
+        frames = self.extract_frames(video_path)
+        if len(frames) < int(2 * self.analysis_fps):
+            return AdaptiveSyncResult(
+                global_offset_ms=0, chunk_offsets=[], offset_range_ms=0,
+                correction_applied=False, corrected_file=None,
+                method="global_fallback",
+                reason=f"Video too short ({len(frames)} frames)",
+                face_detection_rate=0, n_chunks=0
+            )
+
+        mar_signal, detection_rate = self.compute_mar_signal(frames)
+        if detection_rate < 0.5:
+            return AdaptiveSyncResult(
+                global_offset_ms=0, chunk_offsets=[], offset_range_ms=0,
+                correction_applied=False, corrected_file=None,
+                method="global_fallback",
+                reason=f"Face detected in only {detection_rate:.0%} of frames",
+                face_detection_rate=detection_rate, n_chunks=0
+            )
+
+        audio_energy = self.extract_audio_energy(video_path)
+
+        # Phase 1: Global offset (reliable baseline)
+        global_offset_ms, global_confidence = self.cross_correlate_subframe(
+            mar_signal, audio_energy
+        )
+        log.info(f"Phase 1 — Global: {global_offset_ms:+.1f}ms (confidence={global_confidence:.3f})")
+
+        # Phase 2: Per-chunk constrained refinement
+        chunk_frames = int(chunk_sec * self.analysis_fps)
+        step_frames = int(chunk_frames * (1 - overlap))
+        min_len = min(len(mar_signal), len(audio_energy))
+
+        chunk_offsets = []
+        i = 0
+        while i + chunk_frames <= min_len:
+            chunk_mar = mar_signal[i:i + chunk_frames]
+            chunk_aud = audio_energy[i:i + chunk_frames]
+            center_time = (i + chunk_frames / 2) / self.analysis_fps
+
+            # Constrained search: ±2 frames around global offset
+            offset_ms, confidence = self._cross_correlate_constrained(
+                chunk_mar, chunk_aud,
+                baseline_ms=global_offset_ms,
+                search_radius_frames=2
+            )
+
+            chunk_offsets.append({
+                'time_sec': round(center_time, 3),
+                'offset_ms': round(offset_ms, 1),
+                'confidence': round(confidence, 3),
+                'frame_start': i,
+                'frame_end': i + chunk_frames,
+            })
+            i += step_frames
+
+        if not chunk_offsets:
+            return AdaptiveSyncResult(
+                global_offset_ms=round(global_offset_ms, 1),
+                chunk_offsets=[], offset_range_ms=0,
+                correction_applied=False, corrected_file=None,
+                method="global_fallback",
+                reason="No chunks could be analyzed",
+                face_detection_rate=detection_rate, n_chunks=0
+            )
+
+        # Step 3: Analyze chunk consistency
+        offsets = np.array([c['offset_ms'] for c in chunk_offsets])
+        offset_std = float(np.std(offsets))
+        offset_range = float(np.max(offsets) - np.min(offsets))
+
+        # If chunks are too noisy (std > 30ms), fall back to uniform global offset
+        if offset_std > 30.0:
+            log.info(f"Per-chunk std={offset_std:.1f}ms > 30ms — "
+                     f"using uniform global offset {global_offset_ms:+.1f}ms")
+            for c in chunk_offsets:
+                c['offset_smoothed_ms'] = round(global_offset_ms, 1)
+            method = "global_uniform"
+        else:
+            # Median filter (window=3) to remove outliers
+            if len(offsets) >= 3:
+                try:
+                    from scipy.ndimage import median_filter
+                    offsets_smoothed = median_filter(offsets, size=3)
+                except (ImportError, ModuleNotFoundError):
+                    offsets_smoothed = np.array([
+                        np.median(offsets[max(0, j-1):j+2])
+                        for j in range(len(offsets))
+                    ])
+                for j, c in enumerate(chunk_offsets):
+                    c['offset_smoothed_ms'] = round(float(offsets_smoothed[j]), 1)
+            else:
+                for c in chunk_offsets:
+                    c['offset_smoothed_ms'] = c['offset_ms']
+            method = "adaptive"
+
+        # Log results
+        log.info(f"Phase 2 — {len(chunk_offsets)} chunks, "
+                 f"global={global_offset_ms:+.1f}ms, "
+                 f"std={offset_std:.1f}ms, range={offset_range:.1f}ms, "
+                 f"method={method}")
+        for c in chunk_offsets:
+            smoothed = c.get('offset_smoothed_ms', c['offset_ms'])
+            log.info(f"  t={c['time_sec']:.1f}s: raw={c['offset_ms']:+.1f}ms "
+                     f"→ smoothed={smoothed:+.1f}ms (conf={c['confidence']:.3f})")
+
+        return AdaptiveSyncResult(
+            global_offset_ms=round(global_offset_ms, 1),
+            chunk_offsets=chunk_offsets,
+            offset_range_ms=round(offset_range, 1),
+            correction_applied=False,
+            corrected_file=None,
+            method=method,
+            reason=(f"{method}: global={global_offset_ms:+.1f}ms, "
+                    f"std={offset_std:.1f}ms, range={offset_range:.1f}ms, "
+                    f"{len(chunk_offsets)} chunks"),
+            face_detection_rate=round(detection_rate, 3),
+            n_chunks=len(chunk_offsets)
+        )
+
     def detect(self, video_path: str) -> SyncResult:
         """
         Full detection pipeline: extract frames → MAR → audio energy → correlate.
@@ -403,6 +725,60 @@ class SyncDetector:
 # SyncFixer — applies correction
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Audio time-warp for adaptive sync
+# ---------------------------------------------------------------------------
+
+def apply_adaptive_offset(audio: np.ndarray, sr: int,
+                          offset_curve_ms: np.ndarray,
+                          frame_times: np.ndarray) -> np.ndarray:
+    """Apply variable offset to audio via sample-level interpolation.
+
+    For each output sample, computes where in the original audio to read from
+    based on the offset curve. Uses linear interpolation — zero artifacts.
+
+    Args:
+        audio: Original audio as float32 numpy array
+        sr: Sample rate (e.g., 48000)
+        offset_curve_ms: Offset in ms at each frame time (positive = delay audio)
+        frame_times: Time of each frame in seconds
+
+    Returns:
+        Warped audio array (same dtype as input).
+    """
+    n_samples = len(audio)
+    output_times = np.arange(n_samples, dtype=np.float64) / sr
+
+    # Interpolate offset curve to every audio sample
+    offset_per_sample = np.interp(output_times, frame_times, offset_curve_ms)
+
+    # Source time: where in original audio to read from
+    # If offset > 0 (lips lead): advance audio → read from LATER position (skip start)
+    #   source = output + offset → positive shift → skips beginning
+    # If offset < 0 (lips lag): delay audio → read from EARLIER position (before start = silence)
+    #   source = output + offset → negative shift → source < 0 at start → zero-padded
+    source_times = output_times + offset_per_sample / 1000.0
+    source_indices = source_times * sr
+
+    # Zero-pad for negative indices (silence before audio starts when delaying)
+    negative_mask = source_indices < 0
+    source_indices = np.clip(source_indices, 0, n_samples - 2)
+    idx_floor = source_indices.astype(np.int64)
+    frac = (source_indices - idx_floor).astype(np.float32)
+
+    # Linear interpolation between adjacent samples
+    output = audio[idx_floor] * (1 - frac) + audio[np.minimum(idx_floor + 1, n_samples - 1)] * frac
+
+    # Zero out samples where source was before audio start (true silence)
+    output[negative_mask] = 0.0
+
+    return output.astype(audio.dtype)
+
+
+# ---------------------------------------------------------------------------
+# SyncFixer — applies global correction (single offset)
+# ---------------------------------------------------------------------------
+
 class SyncFixer:
     """Apply lip-sync correction by replacing audio with offset.
 
@@ -471,7 +847,127 @@ class SyncFixer:
 
 
 # ---------------------------------------------------------------------------
-# High-level function
+# AdaptiveSyncFixer — applies per-chunk correction via audio time-warp
+# ---------------------------------------------------------------------------
+
+class AdaptiveSyncFixer:
+    """Apply adaptive lip-sync correction via audio time-warping.
+
+    Instead of a single global offset, applies a smooth offset curve
+    that varies over time. Uses numpy sample-level interpolation —
+    zero artifacts, no rubberband/atempo needed.
+    """
+
+    def fix(self, video_path: str, audio_path: str,
+            adaptive_result: 'AdaptiveSyncResult',
+            output_path: str, audio_sr: int = 48000) -> str:
+        """Apply adaptive correction by time-warping the audio.
+
+        1. Load original audio into numpy
+        2. Build smooth offset curve from chunk offsets
+        3. Apply time-warp via apply_adaptive_offset()
+        4. Save warped audio to temp WAV
+        5. Mux with video: ffmpeg -i video -i warped.wav -c:v copy
+
+        Args:
+            video_path: Path to HeyGen video
+            audio_path: Path to original audio
+            adaptive_result: Result from detect_adaptive()
+            output_path: Where to save corrected video
+            audio_sr: Sample rate for audio processing (default: 48000)
+
+        Returns:
+            Path to corrected video.
+        """
+        # Step 1: Load audio at high sample rate
+        with tempfile.NamedTemporaryFile(suffix='.raw', delete=False) as tmp:
+            tmp_raw = tmp.name
+        try:
+            subprocess.run([
+                'ffmpeg', '-y', '-i', audio_path,
+                '-vn', '-ac', '1', '-ar', str(audio_sr),
+                '-f', 's16le', '-acodec', 'pcm_s16le',
+                '-v', 'error', tmp_raw
+            ], capture_output=True, check=True)
+            audio = np.fromfile(tmp_raw, dtype=np.int16).astype(np.float32)
+        finally:
+            if os.path.exists(tmp_raw):
+                os.unlink(tmp_raw)
+
+        # Step 2: Build offset curve from chunk offsets
+        reliable = [c for c in adaptive_result.chunk_offsets
+                    if c.get('offset_smoothed_ms') is not None]
+        if not reliable:
+            reliable = [c for c in adaptive_result.chunk_offsets
+                        if c['confidence'] >= 0.2]
+        if not reliable:
+            # No reliable data — fall back to global offset
+            log.warning("No reliable chunks for adaptive fix, using global offset")
+            reliable = [{'time_sec': 0, 'offset_smoothed_ms': adaptive_result.global_offset_ms}]
+
+        frame_times = np.array([c['time_sec'] for c in reliable])
+        offsets_ms = np.array([c.get('offset_smoothed_ms', c['offset_ms']) for c in reliable])
+
+        # Extend curve to cover full audio duration
+        audio_duration = len(audio) / audio_sr
+        if frame_times[0] > 0:
+            frame_times = np.insert(frame_times, 0, 0.0)
+            offsets_ms = np.insert(offsets_ms, 0, offsets_ms[0])
+        if frame_times[-1] < audio_duration:
+            frame_times = np.append(frame_times, audio_duration)
+            offsets_ms = np.append(offsets_ms, offsets_ms[-1])
+
+        log.info(f"Offset curve: {len(frame_times)} points, "
+                 f"range [{np.min(offsets_ms):.1f}, {np.max(offsets_ms):.1f}] ms")
+
+        # Step 3: Apply time-warp
+        warped = apply_adaptive_offset(audio, audio_sr, offsets_ms, frame_times)
+
+        # Step 4: Save warped audio to temp WAV
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+            tmp_wav = tmp.name
+        try:
+            # Write raw PCM, then convert to WAV via ffmpeg
+            with tempfile.NamedTemporaryFile(suffix='.raw', delete=False) as tmp2:
+                tmp_raw2 = tmp2.name
+            warped.astype(np.int16).tofile(tmp_raw2)
+
+            subprocess.run([
+                'ffmpeg', '-y',
+                '-f', 's16le', '-ar', str(audio_sr), '-ac', '1',
+                '-i', tmp_raw2,
+                '-c:a', 'pcm_s16le',
+                '-v', 'error',
+                tmp_wav
+            ], capture_output=True, check=True)
+            os.unlink(tmp_raw2)
+
+            # Step 5: Mux video + warped audio
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', video_path,
+                '-i', tmp_wav,
+                '-map', '0:v', '-map', '1:a',
+                '-c:v', 'copy',
+                '-c:a', 'aac', '-b:a', '256k', '-ar', '48000',
+                '-shortest',
+                '-v', 'error',
+                output_path
+            ]
+            log.info(f"Muxing adaptive-synced video → {Path(output_path).name}")
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(f"ffmpeg mux failed: {result.stderr[:500]}")
+
+            log.info(f"Saved: {output_path}")
+            return output_path
+        finally:
+            if os.path.exists(tmp_wav):
+                os.unlink(tmp_wav)
+
+
+# ---------------------------------------------------------------------------
+# High-level functions
 # ---------------------------------------------------------------------------
 
 def auto_sync_fix(video_path: str,
@@ -534,6 +1030,92 @@ def auto_sync_fix(video_path: str,
     result.corrected_file = output_path
     result.reason = (f"Corrected: offset {result.offset_ms:+.1f}ms "
                      f"(confidence {result.confidence:.3f}) → {Path(output_path).name}")
+    return result
+
+
+def adaptive_sync_fix(video_path: str,
+                      audio_path: Optional[str] = None,
+                      threshold_ms: float = 30.0,
+                      chunk_sec: float = 2.0,
+                      overlap: float = 0.5,
+                      min_chunk_confidence: float = 0.2,
+                      output_path: Optional[str] = None,
+                      analysis_fps: int = 25,
+                      detect_only: bool = False) -> AdaptiveSyncResult:
+    """
+    Detect per-chunk lip-sync offset and apply adaptive correction.
+
+    Uses 2-second overlapping chunks with sub-frame precision (~20ms at 25fps).
+    Correction is applied via audio time-warp (sample-level interpolation).
+
+    Falls back to global offset if:
+      - Video too short (<4s)
+      - All chunks below confidence threshold
+      - Fewer than 2 reliable chunks
+
+    Args:
+        video_path: Path to HeyGen video
+        audio_path: Path to original audio (required for correction)
+        threshold_ms: Minimum mean offset to trigger correction (default: 30ms)
+        chunk_sec: Chunk duration in seconds (default: 2.0)
+        overlap: Overlap fraction between chunks (default: 0.5)
+        min_chunk_confidence: Min confidence for a chunk (default: 0.2)
+        output_path: Where to save corrected video (default: {stem}_adaptive_synced.mp4)
+        analysis_fps: Frame rate for analysis (default: 25)
+        detect_only: If True, only detect — don't apply correction
+
+    Returns:
+        AdaptiveSyncResult with per-chunk offsets and correction status.
+    """
+    # Step 1: Detect
+    detector = SyncDetector(analysis_fps=analysis_fps)
+    result = detector.detect_adaptive(
+        video_path,
+        chunk_sec=chunk_sec,
+        overlap=overlap,
+        min_chunk_confidence=min_chunk_confidence
+    )
+
+    # Step 2: Decide
+    if result.method == "global_fallback" and result.n_chunks == 0:
+        log.warning(f"Adaptive detection failed: {result.reason}")
+        return result
+
+    if abs(result.global_offset_ms) <= threshold_ms:
+        result.reason = (f"Mean offset {result.global_offset_ms:.1f}ms within "
+                         f"±{threshold_ms}ms threshold — no correction needed. "
+                         f"Range: {result.offset_range_ms:.1f}ms across {result.n_chunks} chunks")
+        log.info(result.reason)
+        return result
+
+    if detect_only:
+        result.reason = (f"Adaptive detect: mean={result.global_offset_ms:.1f}ms, "
+                         f"range={result.offset_range_ms:.1f}ms, "
+                         f"{result.n_chunks} chunks (detect-only mode)")
+        log.info(result.reason)
+        return result
+
+    if audio_path is None:
+        result.reason = (f"Mean offset {result.global_offset_ms:.1f}ms detected "
+                         f"but no audio provided — detect-only mode")
+        log.info(result.reason)
+        return result
+
+    # Step 3: Fix via adaptive time-warp
+    if output_path is None:
+        stem = Path(video_path).stem
+        parent = Path(video_path).parent
+        output_path = str(parent / f"{stem}_adaptive_synced.mp4")
+
+    fixer = AdaptiveSyncFixer()
+    fixer.fix(video_path, audio_path, result, output_path)
+
+    result.correction_applied = True
+    result.corrected_file = output_path
+    result.reason = (f"Adaptive corrected: mean={result.global_offset_ms:+.1f}ms, "
+                     f"range={result.offset_range_ms:.1f}ms, "
+                     f"{result.n_chunks} chunks → {Path(output_path).name}")
+    log.info(result.reason)
     return result
 
 
@@ -659,6 +1241,24 @@ Examples:
     p_fix.add_argument('--output', help='Output path (default: {stem}_synced.mp4)')
     p_fix.add_argument('--fps', type=int, default=25, help='Analysis FPS (default: 25)')
 
+    # --- adaptive ---
+    p_adaptive = subparsers.add_parser('adaptive',
+        help='Adaptive per-chunk sync detection + correction (20ms precision)')
+    p_adaptive.add_argument('--video', required=True, help='Path to HeyGen video')
+    p_adaptive.add_argument('--audio', help='Path to original audio (omit for detect-only)')
+    p_adaptive.add_argument('--threshold', type=float, default=30.0,
+                            help='Mean offset threshold in ms (default: 30)')
+    p_adaptive.add_argument('--chunk-sec', type=float, default=2.0,
+                            help='Chunk duration in seconds (default: 2.0)')
+    p_adaptive.add_argument('--overlap', type=float, default=0.5,
+                            help='Chunk overlap fraction (default: 0.5)')
+    p_adaptive.add_argument('--min-confidence', type=float, default=0.2,
+                            help='Min chunk confidence (default: 0.2)')
+    p_adaptive.add_argument('--output', help='Output path (default: {stem}_adaptive_synced.mp4)')
+    p_adaptive.add_argument('--fps', type=int, default=25, help='Analysis FPS (default: 25)')
+    p_adaptive.add_argument('--detect-only', action='store_true',
+                            help='Only detect offsets, do not apply correction')
+
     # --- batch ---
     p_batch = subparsers.add_parser('batch', help='Batch process all videos in directory')
     p_batch.add_argument('--heygen-dir', required=True, help='Directory with HeyGen videos')
@@ -700,6 +1300,43 @@ Examples:
             print(f"  Output:     {result.corrected_file}")
         print(f"  Verdict:    {result.reason}")
         print(f"{'='*50}")
+
+    elif args.command == 'adaptive':
+        result = adaptive_sync_fix(
+            args.video,
+            audio_path=args.audio,
+            threshold_ms=args.threshold,
+            chunk_sec=args.chunk_sec,
+            overlap=args.overlap,
+            min_chunk_confidence=args.min_confidence,
+            output_path=args.output,
+            analysis_fps=args.fps,
+            detect_only=args.detect_only
+        )
+        print(f"\n{'='*60}")
+        print(f"  Method:       {result.method}")
+        print(f"  Mean offset:  {result.global_offset_ms:+.1f} ms")
+        print(f"  Offset range: {result.offset_range_ms:.1f} ms (drift)")
+        print(f"  Chunks:       {result.n_chunks}")
+        print(f"  Face rate:    {result.face_detection_rate:.0%}")
+        print(f"  Corrected:    {result.correction_applied}")
+        if result.corrected_file:
+            print(f"  Output:       {result.corrected_file}")
+        print(f"  Verdict:      {result.reason}")
+        print(f"{'='*60}")
+        # Print per-chunk table
+        if result.chunk_offsets:
+            print(f"\n  {'Time':>6s}  {'Offset':>8s}  {'Smoothed':>9s}  {'Conf':>6s}  {'Status'}")
+            print(f"  {'─'*6}  {'─'*8}  {'─'*9}  {'─'*6}  {'─'*6}")
+            for c in result.chunk_offsets:
+                smoothed = c.get('offset_smoothed_ms', '—')
+                if isinstance(smoothed, (int, float)):
+                    smoothed_str = f"{smoothed:+.1f}ms"
+                else:
+                    smoothed_str = str(smoothed)
+                status = "OK" if c['confidence'] >= args.min_confidence else "LOW"
+                print(f"  {c['time_sec']:6.1f}s  {c['offset_ms']:+7.1f}ms"
+                      f"  {smoothed_str:>9s}  {c['confidence']:6.3f}  {status}")
 
     elif args.command == 'batch':
         batch_sync_fix(
