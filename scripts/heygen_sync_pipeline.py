@@ -138,7 +138,7 @@ def step_trim(input_path: str, output_path: str,
     os.unlink(tmp_path)
     audio_norm = audio / (np.max(np.abs(audio)) + 1e-8)
 
-    # Energy onset detection
+    # Energy onset detection (two-stage: coarse → fine)
     window_ms = 5
     window_samples = int(sr * window_ms / 1000)
     n_windows = len(audio_norm) // window_samples
@@ -148,19 +148,37 @@ def step_trim(input_path: str, output_path: str,
     ])
 
     peak_energy = np.max(energy)
-    threshold_linear = peak_energy * (10 ** (threshold_db / 20))
 
-    onset_window = 0
+    # Stage 1: Coarse onset — find actual speech start (-25dB from peak)
+    # This ignores noise/room tone and finds real speech
+    coarse_threshold = peak_energy * (10 ** (-25 / 20))  # ~5.6% of peak
+    coarse_onset = 0
     for i, e in enumerate(energy):
-        if e > threshold_linear:
-            onset_window = i
+        if e > coarse_threshold:
+            coarse_onset = i
             break
 
-    onset_ms = onset_window * window_ms
+    # Stage 2: Fine onset — search backward from coarse for quiet consonants
+    # (-55dB from peak catches /с/, /ц/, /ф/)
+    fine_threshold = peak_energy * (10 ** (threshold_db / 20))
+    fine_onset = coarse_onset
+    # Search backward up to 500ms (100 windows) — consonants are short
+    max_lookback = min(coarse_onset, int(500 / window_ms))
+    for i in range(coarse_onset - 1, coarse_onset - max_lookback - 1, -1):
+        if i < 0:
+            break
+        if energy[i] < fine_threshold:
+            fine_onset = i + 1  # first window above threshold
+            break
+    else:
+        fine_onset = max(coarse_onset - max_lookback, 0)
+
+    onset_ms = fine_onset * window_ms
     trim_ms = max(onset_ms - safety_margin_ms, 0)
     trim_sec = trim_ms / 1000.0
 
-    log.info(f"  Onset at {onset_ms}ms, trim at {trim_ms}ms")
+    log.info(f"  Coarse onset at {coarse_onset * window_ms}ms, "
+             f"fine onset at {onset_ms}ms, trim at {trim_ms}ms")
 
     # Apply trim: leading (by onset) + trailing (gentle silenceremove)
     cmd = [

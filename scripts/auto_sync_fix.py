@@ -82,12 +82,12 @@ class SyncDetector:
     """Detect lip-sync offset by cross-correlating visual mouth motion with audio energy."""
 
     def __init__(self, analysis_fps: int = 25, sample_rate: int = 16000,
-                 max_offset_ms: int = 200):
+                 max_offset_ms: int = 400):
         """
         Args:
             analysis_fps: Frame rate for visual analysis (default: 25, native HeyGen rate)
             sample_rate: Audio sample rate for energy analysis (default: 16kHz)
-            max_offset_ms: Maximum offset to search for (default: ±200ms)
+            max_offset_ms: Maximum offset to search for (default: ±400ms)
         """
         self.analysis_fps = analysis_fps
         self.sample_rate = sample_rate
