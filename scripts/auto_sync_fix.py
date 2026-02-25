@@ -273,19 +273,21 @@ class SyncDetector:
 
         vis_fft = np.fft.rfft(vis, fft_size)
         aud_fft = np.fft.rfft(aud, fft_size)
-        # aud × conj(vis): positive lag = audio delayed relative to visual = lips lead
-        correlation = np.fft.irfft(aud_fft * np.conj(vis_fft))
+        # vis × conj(aud): R[k] = Σ aud[n]×vis[n+k]
+        # positive k = visual is AHEAD of audio = lips_lead
+        # negative k = visual is BEHIND audio = lips_lag
+        correlation = np.fft.irfft(vis_fft * np.conj(aud_fft))
 
         # Search within ±max_offset_ms
         max_offset_frames = int(self.max_offset_ms * self.analysis_fps / 1000)
         ms_per_frame = 1000.0 / self.analysis_fps
 
         # Positive lags: correlation[0..max_offset_frames]
-        # = visual leads audio by 0..max_offset_frames frames
+        # = visual leads audio by 0..max_offset_frames frames (lips move first)
         valid_pos = correlation[:max_offset_frames + 1]
 
         # Negative lags: correlation[-(max_offset_frames)..]
-        # = visual lags audio by 1..max_offset_frames frames
+        # = visual lags audio by 1..max_offset_frames frames (lips move late)
         valid_neg = correlation[-max_offset_frames:]
 
         combined = np.concatenate([valid_pos, valid_neg])
@@ -412,7 +414,9 @@ class SyncDetector:
 
         vis_fft = np.fft.rfft(vis, fft_size)
         aud_fft = np.fft.rfft(aud, fft_size)
-        correlation = np.fft.irfft(aud_fft * np.conj(vis_fft))
+        # vis × conj(aud): R[k] = Σ aud[n]×vis[n+k]
+        # positive k = lips_lead, negative k = lips_lag
+        correlation = np.fft.irfft(vis_fft * np.conj(aud_fft))
 
         max_offset_frames = int(self.max_offset_ms * self.analysis_fps / 1000)
         ms_per_frame = 1000.0 / self.analysis_fps
@@ -496,7 +500,9 @@ class SyncDetector:
 
         vis_fft = np.fft.rfft(vis, fft_size)
         aud_fft = np.fft.rfft(aud, fft_size)
-        correlation = np.fft.irfft(aud_fft * np.conj(vis_fft))
+        # vis × conj(aud): R[k] = Σ aud[n]×vis[n+k]
+        # positive k = lips_lead, negative k = lips_lag
+        correlation = np.fft.irfft(vis_fft * np.conj(aud_fft))
 
         # Build search window centered on baseline
         # baseline_frames > 0 → positive lag (indices 0..N in correlation)
@@ -919,10 +925,14 @@ class SyncFixer:
             cmd.extend(['-af', af])
         cmd.extend([
             '-c:a', 'aac', '-b:a', '256k', '-ar', '48000',
-            '-shortest',
-            '-v', 'error',
-            output_path
         ])
+        # For positive offsets (atrim), audio is shorter → use -shortest to match
+        # For negative offsets (adelay), audio is padded → don't use -shortest
+        #   to preserve full audio track (no trimming at end)
+        # For zero offset, use -shortest for clean duration
+        if offset_ms >= 0:
+            cmd.append('-shortest')
+        cmd.extend(['-v', 'error', output_path])
 
         log.info(f"Applying sync-fix: offset={offset_ms:+.1f}ms → {Path(output_path).name}")
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -1330,6 +1340,112 @@ def batch_sync_fix(heygen_dir: str, enhanced_dir: str,
 
 
 # ---------------------------------------------------------------------------
+# Sweep — generate test files for manual offset selection
+# ---------------------------------------------------------------------------
+
+def sweep_sync(video_path: str, audio_path: str,
+               range_ms: int = 200, step_ms: int = 40,
+               output_dir: Optional[str] = None) -> list[str]:
+    """
+    Generate test videos with different offsets for manual comparison.
+
+    Creates N files from -range_ms to +range_ms (step_ms increments).
+    User listens and picks the best-sounding offset.
+
+    Offset convention:
+      negative = lips_lag (audio delayed with adelay, -c:v copy)
+      positive = lips_lead (audio trimmed with atrim, -c:v copy)
+      zero = no offset, just replace audio
+
+    Args:
+        video_path: Path to HeyGen video
+        audio_path: Path to original audio
+        range_ms: Maximum offset to test (default: ±200ms)
+        step_ms: Step between offsets (default: 40ms)
+        output_dir: Where to save test files (default: same directory as video)
+
+    Returns:
+        List of generated file paths.
+    """
+    if output_dir is None:
+        output_dir = str(Path(video_path).parent)
+
+    stem = Path(video_path).stem
+    files = []
+
+    offsets = list(range(-range_ms, range_ms + 1, step_ms))
+    log.info(f"Sweep: generating {len(offsets)} test files for {Path(video_path).name}")
+    log.info(f"  Range: {-range_ms:+d}ms to {+range_ms:+d}ms, step {step_ms}ms")
+
+    for offset_ms in offsets:
+        if offset_ms < 0:
+            label = f"neg{abs(offset_ms)}ms"
+            af = f"adelay={abs(offset_ms)}:all=1"
+        elif offset_ms > 0:
+            label = f"pos{offset_ms}ms"
+            abs_sec = offset_ms / 1000.0
+            af = f"atrim=start={abs_sec:.4f},asetpts=PTS-STARTPTS"
+        else:
+            label = "0ms"
+            af = None
+
+        out_path = os.path.join(output_dir, f"{stem}_sweep_{label}.mp4")
+
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', video_path,
+            '-i', audio_path,
+            '-map', '0:v', '-map', '1:a',
+            '-c:v', 'copy',
+        ]
+        if af:
+            cmd.extend(['-af', af])
+        cmd.extend([
+            '-c:a', 'aac', '-b:a', '256k', '-ar', '48000',
+            '-v', 'error',
+            out_path
+        ])
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            log.error(f"  Failed: {label} — {result.stderr[:200]}")
+            continue
+
+        files.append(out_path)
+
+    log.info(f"Generated {len(files)} test files in {output_dir}")
+    return files
+
+
+def manual_sync_fix(video_path: str, audio_path: str,
+                    offset_ms: float, output_path: Optional[str] = None) -> str:
+    """
+    Apply a manually specified offset without detection.
+
+    Uses -c:v copy (no re-encoding) + audio filter for precise timing.
+    For negative offsets (lips_lag), uses adelay (audio delayed, full audio preserved).
+    For positive offsets (lips_lead), uses atrim (audio trimmed from start).
+
+    Args:
+        video_path: Path to HeyGen video
+        audio_path: Path to original audio
+        offset_ms: Offset in ms (negative = delay audio, positive = trim audio)
+        output_path: Output path (default: {stem}_synced.mp4)
+
+    Returns:
+        Path to corrected video file.
+    """
+    if output_path is None:
+        stem = Path(video_path).stem
+        parent = Path(video_path).parent
+        output_path = str(parent / f"{stem}_synced.mp4")
+
+    fixer = SyncFixer()
+    fixer.fix(video_path, audio_path, offset_ms, output_path)
+    return output_path
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1340,9 +1456,11 @@ def main():
         epilog="""
 Examples:
   %(prog)s detect --video 03-heygen/A2.mp4
-  %(prog)s fix --video 03-heygen/A2.mp4 --audio 02-enhanced/A2_enhanced.mp3
+  %(prog)s fix --video 03-heygen/A2.mp4 --audio 02-enhanced/A2.mp3
+  %(prog)s fix --video 03-heygen/A2.mp4 --audio 02-enhanced/A2.mp3 --offset -80
+  %(prog)s sweep --video 03-heygen/A2.mp4 --audio 02-enhanced/A2.mp3
+  %(prog)s sweep --video 03-heygen/A2.mp4 --audio 02-enhanced/A2.mp3 --range 160 --step 20
   %(prog)s batch --heygen-dir 03-heygen/ --enhanced-dir 02-enhanced/
-  %(prog)s batch --heygen-dir 03-heygen/ --enhanced-dir 02-enhanced/ --threshold 0
         """
     )
     subparsers = parser.add_subparsers(dest='command', required=True)
@@ -1364,8 +1482,21 @@ Examples:
                        help='Min discriminability to trust detection (default: 0.1)')
     p_fix.add_argument('--force', action='store_true',
                        help='Apply correction even with low discriminability')
+    p_fix.add_argument('--offset', type=float, default=None,
+                       help='Manual offset in ms (skip detection). Negative = delay audio, positive = trim audio')
     p_fix.add_argument('--output', help='Output path (default: {stem}_synced.mp4)')
     p_fix.add_argument('--fps', type=int, default=25, help='Analysis FPS (default: 25)')
+
+    # --- sweep ---
+    p_sweep = subparsers.add_parser('sweep',
+        help='Generate test files with different offsets for manual comparison')
+    p_sweep.add_argument('--video', required=True, help='Path to HeyGen video')
+    p_sweep.add_argument('--audio', required=True, help='Path to original audio')
+    p_sweep.add_argument('--range', type=int, default=200, dest='sweep_range',
+                         help='Max offset to test in ms (default: ±200ms)')
+    p_sweep.add_argument('--step', type=int, default=40,
+                         help='Step between offsets in ms (default: 40ms)')
+    p_sweep.add_argument('--output-dir', help='Directory for test files (default: same as video)')
 
     # --- adaptive ---
     p_adaptive = subparsers.add_parser('adaptive',
@@ -1420,30 +1551,48 @@ Examples:
         print(f"{'='*50}")
 
     elif args.command == 'fix':
-        result = auto_sync_fix(
-            args.video, args.audio,
-            threshold_ms=args.threshold,
-            min_confidence=args.confidence,
-            min_discriminability=args.min_disc,
-            output_path=args.output,
-            analysis_fps=args.fps,
-            force=args.force
-        )
-        print(f"\n{'='*50}")
-        print(f"  Offset:          {result.offset_ms:+.1f} ms")
-        print(f"  Direction:       {result.direction}")
-        print(f"  Confidence:      {result.confidence:.3f}")
-        print(f"  Discriminability:{result.discriminability:.3f}"
-              f"{'  ⚠ LOW' if result.discriminability < 0.1 else ''}")
-        print(f"  Corrected:       {result.correction_applied}")
-        if result.corrected_file:
-            print(f"  Output:          {result.corrected_file}")
-        if result.verified_residual_ms is not None:
-            residual_ok = abs(result.verified_residual_ms) <= 40
-            print(f"  Verification:    {result.verified_residual_ms:+.1f}ms"
-                  f" {'✓' if residual_ok else '⚠ CHECK'}")
-        print(f"  Verdict:         {result.reason}")
-        print(f"{'='*50}")
+        if args.offset is not None:
+            # Manual offset — skip detection entirely
+            output_path = args.output
+            if output_path is None:
+                stem = Path(args.video).stem
+                parent = Path(args.video).parent
+                output_path = str(parent / f"{stem}_synced.mp4")
+
+            out = manual_sync_fix(args.video, args.audio, args.offset, output_path)
+            direction = "lips_lag" if args.offset < 0 else ("lips_lead" if args.offset > 0 else "in_sync")
+            print(f"\n{'='*50}")
+            print(f"  Mode:            manual offset")
+            print(f"  Offset:          {args.offset:+.1f} ms")
+            print(f"  Direction:       {direction}")
+            print(f"  Output:          {out}")
+            print(f"{'='*50}")
+        else:
+            # Auto-detect offset
+            result = auto_sync_fix(
+                args.video, args.audio,
+                threshold_ms=args.threshold,
+                min_confidence=args.confidence,
+                min_discriminability=args.min_disc,
+                output_path=args.output,
+                analysis_fps=args.fps,
+                force=args.force
+            )
+            print(f"\n{'='*50}")
+            print(f"  Offset:          {result.offset_ms:+.1f} ms")
+            print(f"  Direction:       {result.direction}")
+            print(f"  Confidence:      {result.confidence:.3f}")
+            print(f"  Discriminability:{result.discriminability:.3f}"
+                  f"{'  ⚠ LOW' if result.discriminability < 0.1 else ''}")
+            print(f"  Corrected:       {result.correction_applied}")
+            if result.corrected_file:
+                print(f"  Output:          {result.corrected_file}")
+            if result.verified_residual_ms is not None:
+                residual_ok = abs(result.verified_residual_ms) <= 40
+                print(f"  Verification:    {result.verified_residual_ms:+.1f}ms"
+                      f" {'✓' if residual_ok else '⚠ CHECK'}")
+            print(f"  Verdict:         {result.reason}")
+            print(f"{'='*50}")
 
     elif args.command == 'adaptive':
         result = adaptive_sync_fix(
@@ -1485,6 +1634,40 @@ Examples:
                 status = "OK" if c['confidence'] >= args.min_confidence else "LOW"
                 print(f"  {c['time_sec']:6.1f}s  {c['offset_ms']:+7.1f}ms"
                       f"  {smoothed_str:>9s}  {c['confidence']:6.3f}  {status}")
+
+    elif args.command == 'sweep':
+        files = sweep_sync(
+            args.video, args.audio,
+            range_ms=args.sweep_range,
+            step_ms=args.step,
+            output_dir=args.output_dir
+        )
+        stem = Path(args.video).stem
+        print(f"\n{'='*60}")
+        print(f"  SWEEP: {len(files)} test files generated")
+        print(f"  Range: {-args.sweep_range:+d}ms to {+args.sweep_range:+d}ms, step {args.step}ms")
+        print(f"{'='*60}")
+        print()
+        print("  Listen to each file and find the best sync:")
+        print()
+        for f in files:
+            name = Path(f).name
+            # Extract offset from filename
+            if '_sweep_neg' in name:
+                ms = name.split('_sweep_neg')[1].replace('ms.mp4', '')
+                print(f"    {name:45s}  offset: -{ms}ms")
+            elif '_sweep_pos' in name:
+                ms = name.split('_sweep_pos')[1].replace('ms.mp4', '')
+                print(f"    {name:45s}  offset: +{ms}ms")
+            elif '_sweep_0ms' in name:
+                print(f"    {name:45s}  offset:  0ms")
+        print()
+        print("  Once you pick the best offset, create the final file:")
+        print(f"    python {sys.argv[0]} fix --video {args.video} --audio {args.audio} --offset <OFFSET>")
+        print()
+        print("  Then clean up sweep files:")
+        print(f"    rm {Path(files[0]).parent}/{stem}_sweep_*.mp4")
+        print(f"{'='*60}")
 
     elif args.command == 'batch':
         batch_sync_fix(
