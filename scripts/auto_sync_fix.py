@@ -645,29 +645,59 @@ class SyncDetector:
         offset_std = float(np.std(offsets))
         offset_range = float(np.max(offsets) - np.min(offsets))
 
-        # If chunks are too noisy (std > 30ms), fall back to uniform global offset
-        if offset_std > 30.0:
-            log.info(f"Per-chunk std={offset_std:.1f}ms > 30ms — "
-                     f"using uniform global offset {global_offset_ms:+.1f}ms")
+        # Choose smoothing strategy based on per-chunk variance:
+        #   std ≤ 30ms:  mild smoothing (median window=3) — per-chunk variation is real
+        #   30 < std ≤ 80ms: heavy smoothing (median window=5) — mix of real drift + noise
+        #   std > 80ms:  fall back to uniform global offset — too noisy to trust
+        if offset_std > 80.0:
+            log.info(f"Per-chunk std={offset_std:.1f}ms > 80ms — "
+                     f"too noisy, using uniform global offset {global_offset_ms:+.1f}ms")
             for c in chunk_offsets:
                 c['offset_smoothed_ms'] = round(global_offset_ms, 1)
             method = "global_uniform"
         else:
-            # Median filter (window=3) to remove outliers
-            if len(offsets) >= 3:
+            # Median filter to remove outliers, window size depends on noise level
+            median_window = 5 if offset_std > 30.0 else 3
+            if offset_std > 30.0:
+                log.info(f"Per-chunk std={offset_std:.1f}ms > 30ms — "
+                         f"using wider smoothing (median window={median_window})")
+
+            if len(offsets) >= median_window:
                 try:
                     from scipy.ndimage import median_filter
-                    offsets_smoothed = median_filter(offsets, size=3)
+                    offsets_smoothed = median_filter(offsets, size=median_window)
                 except (ImportError, ModuleNotFoundError):
+                    hw = median_window // 2
                     offsets_smoothed = np.array([
-                        np.median(offsets[max(0, j-1):j+2])
+                        np.median(offsets[max(0, j-hw):j+hw+1])
                         for j in range(len(offsets))
                     ])
-                for j, c in enumerate(chunk_offsets):
-                    c['offset_smoothed_ms'] = round(float(offsets_smoothed[j]), 1)
             else:
-                for c in chunk_offsets:
-                    c['offset_smoothed_ms'] = c['offset_ms']
+                offsets_smoothed = offsets.copy()
+
+            # Rate-of-change limiter: prevent sharp offset jumps that cause
+            # audible pitch artifacts in the time-warped audio.
+            # Max 20ms change per chunk (~1s step) = ~2% speed change = inaudible.
+            # Without this, a 90ms jump over 1s = 9% speed change = very audible.
+            max_rate_ms = 20.0  # max offset change per chunk step
+            chunk_step_sec = chunk_sec * (1 - overlap)
+            max_rate_per_step = max_rate_ms  # per chunk step
+
+            rate_limited = np.array(offsets_smoothed, dtype=np.float64)
+            # Forward pass: limit how fast offset can increase or decrease
+            for j in range(1, len(rate_limited)):
+                delta = rate_limited[j] - rate_limited[j - 1]
+                if abs(delta) > max_rate_per_step:
+                    rate_limited[j] = rate_limited[j - 1] + np.sign(delta) * max_rate_per_step
+            # Backward pass: symmetric smoothing from the end
+            for j in range(len(rate_limited) - 2, -1, -1):
+                delta = rate_limited[j] - rate_limited[j + 1]
+                if abs(delta) > max_rate_per_step:
+                    rate_limited[j] = rate_limited[j + 1] + np.sign(delta) * max_rate_per_step
+
+            offsets_smoothed = rate_limited
+            for j, c in enumerate(chunk_offsets):
+                c['offset_smoothed_ms'] = round(float(offsets_smoothed[j]), 1)
             method = "adaptive"
 
         # Log results
@@ -902,6 +932,18 @@ class SyncFixer:
         abs_ms = abs(offset_ms)
         abs_sec = abs_ms / 1000.0
 
+        # Get video duration to limit output (prevents black frames
+        # when audio is longer than video)
+        probe_cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=duration',
+            '-of', 'csv=p=0',
+            video_path
+        ]
+        probe = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+        video_duration = float(probe.stdout.strip())
+
         if offset_ms > 0:
             # Lips lead audio → advance audio (trim start so audio plays earlier)
             # This makes sound arrive earlier to match the early lip movement
@@ -926,12 +968,9 @@ class SyncFixer:
         cmd.extend([
             '-c:a', 'aac', '-b:a', '256k', '-ar', '48000',
         ])
-        # For positive offsets (atrim), audio is shorter → use -shortest to match
-        # For negative offsets (adelay), audio is padded → don't use -shortest
-        #   to preserve full audio track (no trimming at end)
-        # For zero offset, use -shortest for clean duration
-        if offset_ms >= 0:
-            cmd.append('-shortest')
+        # Limit output to video duration — prevents black frames
+        # when audio file is longer than video (e.g., V1: 15s video + 455s audio)
+        cmd.extend(['-t', f'{video_duration:.6f}'])
         cmd.extend(['-v', 'error', output_path])
 
         log.info(f"Applying sync-fix: offset={offset_ms:+.1f}ms → {Path(output_path).name}")
@@ -1373,6 +1412,18 @@ def sweep_sync(video_path: str, audio_path: str,
     stem = Path(video_path).stem
     files = []
 
+    # Get video duration to limit output (prevents black frames
+    # when audio is longer than video)
+    probe_cmd = [
+        'ffprobe', '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=duration',
+        '-of', 'csv=p=0',
+        video_path
+    ]
+    probe = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+    video_duration = float(probe.stdout.strip())
+
     offsets = list(range(-range_ms, range_ms + 1, step_ms))
     log.info(f"Sweep: generating {len(offsets)} test files for {Path(video_path).name}")
     log.info(f"  Range: {-range_ms:+d}ms to {+range_ms:+d}ms, step {step_ms}ms")
@@ -1402,6 +1453,7 @@ def sweep_sync(video_path: str, audio_path: str,
             cmd.extend(['-af', af])
         cmd.extend([
             '-c:a', 'aac', '-b:a', '256k', '-ar', '48000',
+            '-t', f'{video_duration:.6f}',
             '-v', 'error',
             out_path
         ])
