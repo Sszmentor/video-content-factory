@@ -74,6 +74,7 @@ class AdaptiveSyncResult:
     reason: str
     face_detection_rate: float
     n_chunks: int
+    global_discriminability: float = 0.0  # discriminability of global offset (0-1)
 
 
 # ---------------------------------------------------------------------------
@@ -684,7 +685,8 @@ class SyncDetector:
                     f"std={offset_std:.1f}ms, range={offset_range:.1f}ms, "
                     f"{len(chunk_offsets)} chunks"),
             face_detection_rate=round(detection_rate, 3),
-            n_chunks=len(chunk_offsets)
+            n_chunks=len(chunk_offsets),
+            global_discriminability=round(global_disc, 3)
         )
 
     def detect(self, video_path: str) -> SyncResult:
@@ -1059,8 +1061,10 @@ def auto_sync_fix(video_path: str,
                   audio_path: Optional[str] = None,
                   threshold_ms: float = 30.0,
                   min_confidence: float = 0.3,
+                  min_discriminability: float = 0.1,
                   output_path: Optional[str] = None,
-                  analysis_fps: int = 25) -> SyncResult:
+                  analysis_fps: int = 25,
+                  force: bool = False) -> SyncResult:
     """
     Detect lip-sync offset and apply correction if needed.
 
@@ -1068,9 +1072,14 @@ def auto_sync_fix(video_path: str,
         video_path: Path to HeyGen video
         audio_path: Path to original audio (required for correction)
         threshold_ms: Minimum offset to trigger correction (default: 30ms)
-        min_confidence: Minimum confidence to trust detection (default: 0.5)
+        min_confidence: Minimum confidence to trust detection (default: 0.3)
+        min_discriminability: Minimum discriminability to trust detection (default: 0.1).
+            When discriminability is below this threshold, the cross-correlation peak
+            is barely distinguishable from noise and the detected offset may be wrong.
+            Use --force to override.
         output_path: Where to save corrected video (default: {stem}_synced.mp4)
         analysis_fps: Frame rate for analysis (default: 25)
+        force: If True, apply correction even with low discriminability (default: False)
 
     Returns:
         SyncResult with detection details and correction status.
@@ -1093,6 +1102,19 @@ def auto_sync_fix(video_path: str,
     if result.confidence < min_confidence:
         result.reason = (f"Confidence {result.confidence:.3f} below {min_confidence} — "
                          f"skipping correction (offset was {result.offset_ms:.1f}ms)")
+        log.warning(result.reason)
+        return result
+
+    # Discriminability safeguard: when the peak is barely above noise,
+    # the detected offset is unreliable and may cause WORSE sync.
+    # V3_G1 case: disc=0.027, detected +320ms, true offset was -160ms.
+    if result.discriminability < min_discriminability and not force:
+        result.reason = (
+            f"⚠ UNRELIABLE: discriminability {result.discriminability:.3f} below {min_discriminability} — "
+            f"the detected offset {result.offset_ms:+.1f}ms may be WRONG. "
+            f"Cross-correlation peak is barely above noise. "
+            f"Use --force to override, or manually test offsets with the fix command."
+        )
         log.warning(result.reason)
         return result
 
@@ -1124,9 +1146,11 @@ def adaptive_sync_fix(video_path: str,
                       chunk_sec: float = 2.0,
                       overlap: float = 0.5,
                       min_chunk_confidence: float = 0.2,
+                      min_discriminability: float = 0.1,
                       output_path: Optional[str] = None,
                       analysis_fps: int = 25,
-                      detect_only: bool = False) -> AdaptiveSyncResult:
+                      detect_only: bool = False,
+                      force: bool = False) -> AdaptiveSyncResult:
     """
     Detect per-chunk lip-sync offset and apply adaptive correction.
 
@@ -1145,9 +1169,11 @@ def adaptive_sync_fix(video_path: str,
         chunk_sec: Chunk duration in seconds (default: 2.0)
         overlap: Overlap fraction between chunks (default: 0.5)
         min_chunk_confidence: Min confidence for a chunk (default: 0.2)
+        min_discriminability: Minimum discriminability to trust detection (default: 0.1)
         output_path: Where to save corrected video (default: {stem}_adaptive_synced.mp4)
         analysis_fps: Frame rate for analysis (default: 25)
         detect_only: If True, only detect — don't apply correction
+        force: If True, apply correction even with low discriminability
 
     Returns:
         AdaptiveSyncResult with per-chunk offsets and correction status.
@@ -1171,6 +1197,17 @@ def adaptive_sync_fix(video_path: str,
                          f"±{threshold_ms}ms threshold — no correction needed. "
                          f"Range: {result.offset_range_ms:.1f}ms across {result.n_chunks} chunks")
         log.info(result.reason)
+        return result
+
+    # Discriminability safeguard
+    if result.global_discriminability < min_discriminability and not force:
+        result.reason = (
+            f"⚠ UNRELIABLE: discriminability {result.global_discriminability:.3f} below "
+            f"{min_discriminability} — the detected offset {result.global_offset_ms:+.1f}ms "
+            f"may be WRONG. Cross-correlation peak is barely above noise. "
+            f"Use --force to override, or manually test offsets."
+        )
+        log.warning(result.reason)
         return result
 
     if detect_only:
@@ -1323,6 +1360,10 @@ Examples:
                        help='Correction threshold in ms (default: 30)')
     p_fix.add_argument('--confidence', type=float, default=0.3,
                        help='Min confidence (default: 0.3)')
+    p_fix.add_argument('--min-disc', type=float, default=0.1,
+                       help='Min discriminability to trust detection (default: 0.1)')
+    p_fix.add_argument('--force', action='store_true',
+                       help='Apply correction even with low discriminability')
     p_fix.add_argument('--output', help='Output path (default: {stem}_synced.mp4)')
     p_fix.add_argument('--fps', type=int, default=25, help='Analysis FPS (default: 25)')
 
@@ -1339,6 +1380,10 @@ Examples:
                             help='Chunk overlap fraction (default: 0.5)')
     p_adaptive.add_argument('--min-confidence', type=float, default=0.2,
                             help='Min chunk confidence (default: 0.2)')
+    p_adaptive.add_argument('--min-disc', type=float, default=0.1,
+                            help='Min discriminability to trust detection (default: 0.1)')
+    p_adaptive.add_argument('--force', action='store_true',
+                            help='Apply correction even with low discriminability')
     p_adaptive.add_argument('--output', help='Output path (default: {stem}_adaptive_synced.mp4)')
     p_adaptive.add_argument('--fps', type=int, default=25, help='Analysis FPS (default: 25)')
     p_adaptive.add_argument('--detect-only', action='store_true',
@@ -1379,8 +1424,10 @@ Examples:
             args.video, args.audio,
             threshold_ms=args.threshold,
             min_confidence=args.confidence,
+            min_discriminability=args.min_disc,
             output_path=args.output,
-            analysis_fps=args.fps
+            analysis_fps=args.fps,
+            force=args.force
         )
         print(f"\n{'='*50}")
         print(f"  Offset:          {result.offset_ms:+.1f} ms")
@@ -1406,13 +1453,17 @@ Examples:
             chunk_sec=args.chunk_sec,
             overlap=args.overlap,
             min_chunk_confidence=args.min_confidence,
+            min_discriminability=args.min_disc,
             output_path=args.output,
             analysis_fps=args.fps,
-            detect_only=args.detect_only
+            detect_only=args.detect_only,
+            force=args.force
         )
         print(f"\n{'='*60}")
         print(f"  Method:       {result.method}")
         print(f"  Mean offset:  {result.global_offset_ms:+.1f} ms")
+        print(f"  Discriminability: {result.global_discriminability:.3f}"
+              f"{'  ⚠ LOW' if result.global_discriminability < 0.1 else ''}")
         print(f"  Offset range: {result.offset_range_ms:.1f} ms (drift)")
         print(f"  Chunks:       {result.n_chunks}")
         print(f"  Face rate:    {result.face_detection_rate:.0%}")
