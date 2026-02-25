@@ -551,10 +551,12 @@ class SyncDetector:
     def detect_adaptive(self, video_path: str,
                         chunk_sec: float = 2.0,
                         overlap: float = 0.5,
-                        min_chunk_confidence: float = 0.2) -> AdaptiveSyncResult:
+                        min_chunk_confidence: float = 0.2,
+                        baseline_offset_ms: Optional[float] = None) -> AdaptiveSyncResult:
         """Two-phase adaptive lip-sync detection with sub-frame precision.
 
         Phase 1: Compute global offset using full signal (reliable baseline).
+                 Or use user-provided baseline_offset_ms if given (for low-disc videos).
         Phase 2: Per-chunk constrained refinement — search within ±2 frames
                  of global offset, then parabolic interpolation for ~20ms precision.
 
@@ -566,6 +568,9 @@ class SyncDetector:
             chunk_sec: Chunk duration in seconds (default: 2.0)
             overlap: Overlap fraction between chunks (default: 0.5 = 50%)
             min_chunk_confidence: Minimum confidence for a chunk to be trusted
+            baseline_offset_ms: Manual baseline offset in ms (skip Phase 1 detection).
+                Use when discriminability is too low for reliable auto-detection.
+                Get the right value from sweep command.
 
         Returns:
             AdaptiveSyncResult with per-chunk offsets and smoothed curve.
@@ -596,11 +601,18 @@ class SyncDetector:
         audio_energy = self.extract_audio_energy(video_path)
 
         # Phase 1: Global offset (reliable baseline)
-        global_offset_ms, global_confidence, global_disc = self.cross_correlate_subframe(
-            mar_signal, audio_energy
-        )
-        log.info(f"Phase 1 — Global: {global_offset_ms:+.1f}ms "
-                 f"(confidence={global_confidence:.3f}, discriminability={global_disc:.3f})")
+        if baseline_offset_ms is not None:
+            # User provided manual baseline — skip unreliable auto-detection
+            global_offset_ms = baseline_offset_ms
+            global_confidence = 1.0  # manual = trusted
+            global_disc = 1.0
+            log.info(f"Phase 1 — Manual baseline: {global_offset_ms:+.1f}ms (user-provided)")
+        else:
+            global_offset_ms, global_confidence, global_disc = self.cross_correlate_subframe(
+                mar_signal, audio_energy
+            )
+            log.info(f"Phase 1 — Global: {global_offset_ms:+.1f}ms "
+                     f"(confidence={global_confidence:.3f}, discriminability={global_disc:.3f})")
 
         # Phase 2: Per-chunk constrained refinement
         chunk_frames = int(chunk_sec * self.analysis_fps)
@@ -1199,7 +1211,8 @@ def adaptive_sync_fix(video_path: str,
                       output_path: Optional[str] = None,
                       analysis_fps: int = 25,
                       detect_only: bool = False,
-                      force: bool = False) -> AdaptiveSyncResult:
+                      force: bool = False,
+                      baseline_offset_ms: Optional[float] = None) -> AdaptiveSyncResult:
     """
     Detect per-chunk lip-sync offset and apply adaptive correction.
 
@@ -1223,6 +1236,8 @@ def adaptive_sync_fix(video_path: str,
         analysis_fps: Frame rate for analysis (default: 25)
         detect_only: If True, only detect — don't apply correction
         force: If True, apply correction even with low discriminability
+        baseline_offset_ms: Manual baseline offset in ms (skip auto-detection of global offset).
+            Use when discriminability is too low. Get from sweep command.
 
     Returns:
         AdaptiveSyncResult with per-chunk offsets and correction status.
@@ -1233,7 +1248,8 @@ def adaptive_sync_fix(video_path: str,
         video_path,
         chunk_sec=chunk_sec,
         overlap=overlap,
-        min_chunk_confidence=min_chunk_confidence
+        min_chunk_confidence=min_chunk_confidence,
+        baseline_offset_ms=baseline_offset_ms
     )
 
     # Step 2: Decide
@@ -1241,23 +1257,25 @@ def adaptive_sync_fix(video_path: str,
         log.warning(f"Adaptive detection failed: {result.reason}")
         return result
 
-    if abs(result.global_offset_ms) <= threshold_ms:
-        result.reason = (f"Mean offset {result.global_offset_ms:.1f}ms within "
-                         f"±{threshold_ms}ms threshold — no correction needed. "
-                         f"Range: {result.offset_range_ms:.1f}ms across {result.n_chunks} chunks")
-        log.info(result.reason)
-        return result
+    # When baseline is manually provided, skip threshold and disc checks
+    if baseline_offset_ms is None:
+        if abs(result.global_offset_ms) <= threshold_ms:
+            result.reason = (f"Mean offset {result.global_offset_ms:.1f}ms within "
+                             f"±{threshold_ms}ms threshold — no correction needed. "
+                             f"Range: {result.offset_range_ms:.1f}ms across {result.n_chunks} chunks")
+            log.info(result.reason)
+            return result
 
-    # Discriminability safeguard
-    if result.global_discriminability < min_discriminability and not force:
-        result.reason = (
-            f"⚠ UNRELIABLE: discriminability {result.global_discriminability:.3f} below "
-            f"{min_discriminability} — the detected offset {result.global_offset_ms:+.1f}ms "
-            f"may be WRONG. Cross-correlation peak is barely above noise. "
-            f"Use --force to override, or manually test offsets."
-        )
-        log.warning(result.reason)
-        return result
+        # Discriminability safeguard
+        if result.global_discriminability < min_discriminability and not force:
+            result.reason = (
+                f"⚠ UNRELIABLE: discriminability {result.global_discriminability:.3f} below "
+                f"{min_discriminability} — the detected offset {result.global_offset_ms:+.1f}ms "
+                f"may be WRONG. Cross-correlation peak is barely above noise. "
+                f"Use --force to override, or use --baseline-offset with a known good offset."
+            )
+            log.warning(result.reason)
+            return result
 
     if detect_only:
         result.reason = (f"Adaptive detect: mean={result.global_offset_ms:.1f}ms, "
@@ -1571,6 +1589,9 @@ Examples:
     p_adaptive.add_argument('--fps', type=int, default=25, help='Analysis FPS (default: 25)')
     p_adaptive.add_argument('--detect-only', action='store_true',
                             help='Only detect offsets, do not apply correction')
+    p_adaptive.add_argument('--baseline-offset', type=float, default=None,
+                            help='Manual baseline offset in ms (skip auto-detection). '
+                                 'Use when disc is too low. Get from sweep command.')
 
     # --- batch ---
     p_batch = subparsers.add_parser('batch', help='Batch process all videos in directory')
@@ -1658,7 +1679,8 @@ Examples:
             output_path=args.output,
             analysis_fps=args.fps,
             detect_only=args.detect_only,
-            force=args.force
+            force=args.force,
+            baseline_offset_ms=args.baseline_offset
         )
         print(f"\n{'='*60}")
         print(f"  Method:       {result.method}")
