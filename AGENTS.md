@@ -1,7 +1,7 @@
 # AGENTS.md — Shared Rules for All AI Agents
 # Applies to: Claude Code, Codex, and any future coding agents
 # Location: root of ~/Projects/AI_Agents/ (symlink into each repo as needed)
-# Version: 1.0 (2026-03-03)
+# Version: 1.1 (2026-03-03) — added worktree isolation rule
 
 ## Project Structure
 
@@ -45,6 +45,28 @@ Git repos are NOT in Dropbox. Code syncs via GitHub, data syncs via Dropbox.
 - "Студенты" (students), NEVER "ученики" (pupils) — it's a DeFi University
 - Em-dash `—` (U+2014) ONLY. Never `–` or `-` as a dash
 - Product tiers: 0→1→2→3→4. Never sell same or lower tier
+
+## Worktree Isolation (CRITICAL)
+
+When two agents work on the same repo locally, they MUST use separate git worktrees.
+Without this, concurrent git operations cause `index.lock` conflicts.
+
+```bash
+# One-time setup per repo:
+cd ~/Projects/AI_Agents/<repo>
+git worktree add ../<repo>-codex -b codex/workspace
+```
+
+| Agent | Working directory | Branch convention |
+|-------|-------------------|-------------------|
+| Claude Code | `<repo>/` | `main`, `feat/...`, `fix/...` |
+| Codex CLI | `<repo>-codex/` | `codex/...` |
+
+Rules:
+- Each agent works ONLY in its own worktree — never touch the other's directory
+- Merge via PR on GitHub, never by direct push to the other worktree's branch
+- If worktree becomes stale: `git worktree remove ../<repo>-codex` and recreate
+- NEVER delete `.git/index.lock` without confirming no git process is running
 
 ## Coordination
 
