@@ -36,3 +36,18 @@ Thumbs.db
 # Secrets
 *.pem
 *.key
+
+# Credentials & Tokens
+client_secret.json
+youtube_token.json
+*_token.json
+*.session
+.session
+
+# Scripts with embedded secrets
+scripts/youtube_upload.py
+
+# Audio/media files
+*_audio
+*.wav
+*.mp3
