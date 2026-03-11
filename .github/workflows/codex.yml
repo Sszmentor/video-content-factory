@@ -1,0 +1,82 @@
+name: Codex Worker
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  codex-task:
+    if: |
+      (github.event_name == 'issues' && github.event.label.name == 'codex-task') ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@codex'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          sandbox: workspace-write
+          safety-strategy: drop-sudo
+          prompt: |
+            You are a coding agent for the video-content-factory project.
+            This is a video content production pipeline: processing raw footage, transcription, AI editing, publishing to YouTube/Shorts/Reels.
+            Stack: Python, ffmpeg, yt-dlp, HeyGen API, Railway deployment.
+
+            ## ISSUE #${{ github.event.issue.number }}: ${{ github.event.issue.title }}
+
+            ${{ github.event.issue.body }}
+
+            ## END OF ISSUE
+
+            WORKFLOW:
+            1. Read AGENTS.md for project conventions
+            2. Implement ALL items from the issue
+            3. After writing code, stage and commit: git add -A && git commit -m "feat: <description>"
+            4. Run tests: python3 -m pytest tests/ -v || python3 -m unittest discover -s tests -p 'test_*.py' -v || echo "No tests yet"
+            5. If tests fail, fix and commit again
+            6. Do NOT run git push or create PR — the CI handles that automatically
+
+            CODING STANDARDS:
+            - Python 3.11+, async/await where applicable
+            - Follow existing code style
+            - Read AGENTS.md for commit and branch conventions
+
+            Implement the issue now.
+
+      - name: Create PR from Codex changes
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if git diff --quiet HEAD origin/main; then
+            echo "No changes detected, skipping PR creation"
+            exit 0
+          fi
+
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+          ISSUE_TITLE="${{ github.event.issue.title }}"
+          BRANCH_NAME="codex/issue-${ISSUE_NUMBER}"
+
+          git config user.name "Codex"
+          git config user.email "noreply@openai.com"
+          git checkout -b "$BRANCH_NAME"
+          git push -u origin "$BRANCH_NAME"
+
+          gh pr create \
+            --title "$ISSUE_TITLE" \
+            --body "Closes #${ISSUE_NUMBER}
+
+          Implemented by Codex Worker, pending review by Claude Code (Opus)." \
+            --base main \
+            --head "$BRANCH_NAME"
